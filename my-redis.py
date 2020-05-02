@@ -3,7 +3,7 @@
 import sys
 import io
 from optparse import OptionParser
-from redis import Redis
+from redis import Redis, exceptions
 import gzip
 
 verbose = False
@@ -21,6 +21,10 @@ def main():
     parser.add_option('-c', '--command', help='Execute Redis command')
     parser.add_option('--verbose', action='store_true', default=False, help='Verbose mode')
 
+    if len(sys.argv) < 2:
+        parser.print_help()
+        sys.exit(1)
+
     (options, args) = parser.parse_args()
 
     global verbose
@@ -31,7 +35,7 @@ def main():
     if '/' in options.group:
         options.db = int(options.group.split('/')[1])
 
-    client = Redis(host=options.hostname, db=options.db)
+    client = Redis(host=options.hostname, db=options.db, password=options.password)
     if options.command:
         execute_command(client, options.command)
     elif options.scan:
@@ -59,39 +63,50 @@ def scan_keys(client: Redis, pattern):
         cursor = result[0]
 
 
-def execute_command(client: Redis, command: str):
-    split = command.split()
-    if len(split) == 0:
-        print('require key', file=sys.stderr)
+def execute_command(client: Redis, command_str: str):
+    split = command_str.split()
+    command = split[0].upper()
 
-    if split[0].upper() == 'GET':
-        get_command(client, split[1])
+    if command == 'GET':
+        get_command(client, split[1:])
+    elif command == 'TYPE':
+        type_command(client, split[1:])
     else:
         print("Unsupported command '{}'".format(split[0]), file=sys.stderr)
 
 
-def get_command(client: Redis, key):
-    data = client.get(key)
-    if data is not None:
-        verbose_info("object size: {}".format(len(data)))
-        if data[0:2] == bytes.fromhex('1f8b'):
-            verbose_info("found gzip format data at key {}".format(key))
-            verbose_info("bytes: {}".format(data))
-            data = gzip.decompress(data)
-        elif data[0:4] == bytes.fromhex('4f626a01'):
-            verbose_info("found Avro format at at key {}".format(key))
-            verbose_info("bytes: {}".format(data))
-            data = deserialize_avro(data)
-        try:
-            print(data.decode(), flush=True)
-        except UnicodeDecodeError:
+def get_command(client: Redis, param):
+    if len(param) == 0:
+        print('require key', file=sys.stderr)
+
+    key = param[0]
+    try:
+        data = client.get(key)
+        if data is not None:
+            verbose_info("object size: {}".format(len(data)))
+            if data[0:2] == bytes.fromhex('1f8b'):
+                verbose_info("found gzip format data at key {}".format(key))
+                verbose_info("bytes: {}".format(data))
+                data = gzip.decompress(data)
+            elif data[0:4] == bytes.fromhex('4f626a01'):
+                verbose_info("found Avro format at at key {}".format(key))
+                verbose_info("bytes: {}".format(data))
+                data = deserialize_avro(data)
+            try:
+                print(data.decode(), flush=True)
+            except UnicodeDecodeError:
+                print(data)
+        else:
             print(data)
-    else:
-        print(data)
+    except exceptions.ResponseError as er:
+        print(er.args[0])
 
 
-# from avro.io import DatumReader
-# from avro.datafile import DataFileReader
+def type_command(client: Redis, param):
+    if len(param) == 0:
+        print('require key', file=sys.stderr)
+    key = param[0]
+    print(client.type(key).decode())
 
 
 def deserialize_avro(data):
