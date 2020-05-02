@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import sys
+import io
 from optparse import OptionParser
 from redis import Redis
 import gzip
@@ -72,12 +73,36 @@ def execute_command(client: Redis, command: str):
 def get_command(client: Redis, key):
     data = client.get(key)
     if data is not None:
+        verbose_info("object size: {}".format(len(data)))
         if data[0:2] == bytes.fromhex('1f8b'):
             verbose_info("found gzip format data at key {}".format(key))
+            verbose_info("bytes: {}".format(data))
             data = gzip.decompress(data)
-        print(data.decode(), flush=True)
+        elif data[0:4] == bytes.fromhex('4f626a01'):
+            verbose_info("found Avro format at at key {}".format(key))
+            verbose_info("bytes: {}".format(data))
+            data = deserialize_avro(data)
+        try:
+            print(data.decode(), flush=True)
+        except UnicodeDecodeError:
+            print(data)
     else:
         print(data)
+
+
+# from avro.io import DatumReader
+# from avro.datafile import DataFileReader
+
+
+def deserialize_avro(data):
+    from fastavro import reader
+    import json
+
+    buf = io.BytesIO(data)
+    lines = []
+    for record in reader(buf):
+        lines.append(json.dumps(record))
+    return '\n'.join(lines).encode()
 
 
 def verbose_info(msg):
