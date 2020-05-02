@@ -10,6 +10,7 @@ import functools
 
 print = functools.partial(print, flush=True)
 verbose = False
+supported_commands = ['get', 'type', 'hget', 'hgetall', 'smembers', 'info']
 
 
 def main():
@@ -23,7 +24,10 @@ def main():
     parser.add_option('-a', '--password', metavar='<password>', help='Password to use when connecting to the server.')
     parser.add_option("-n", '--db', metavar='<db>', default=0, type='int', help='Redis database number.')
     parser.add_option('--scan', metavar='<pattern>', help='List all keys using the SCAN command for the pattern.')
-    parser.add_option('-t', '--top', default=sys.maxsize, metavar='<num>', help='List top N found keys when using --scan.')
+    parser.add_option('-t', '--top', default=sys.maxsize, metavar='<num>', type='int',
+                      help='List top N found keys when using --scan.')
+    parser.add_option('-m', '--show-memory-usage', default=False, action='store_true',
+                      help='Calculate memory usage when using --scan')
     parser.add_option('-v', '--verbose', action='store_true', default=False, help='Verbose mode')
     parser.add_option('--help', action='help', help='Print this help information.')
 
@@ -52,7 +56,7 @@ def main():
     if redis_command:
         execute_command(client, redis_command)
     elif options.scan:
-        scan_keys(client, options.scan, int(options.top))
+        scan_keys(client, options.scan, options.top, options.show_memory_usage)
 
 
 def parse_redis_command():
@@ -105,34 +109,46 @@ def parse_hostname_by_elasticache_cluster_name(cluster, force):
     return primary
 
 
-def scan_keys(client: Redis, pattern, top: int):
+def scan_keys(client: Redis, pattern, top: int, show_memory_usage):
+    memory_usage = 0
     limit = 0
     count = 20000
     result = client.scan(0, pattern, count)
     cursor = result[0]
     while cursor != 0:
-        for k in result[1]:
-            print(k.decode())
+        batch = []
+        for key in result[1]:
+            batch.append(key)
             limit += 1
+
+            if show_memory_usage:
+                usage = client.memory_usage(key.decode())
+                print('{:<25s} {}'.format(key.decode(), usage))
+                memory_usage += usage
+            else:
+                print(key.decode())
+
             if limit == top:
-                return
+                break
+
+        if limit == top:
+            break
 
         result = client.scan(cursor, pattern, count)
         cursor = result[0]
 
+    if show_memory_usage:
+        print('Summary: keys: {}, total memory usage: {}'.format(limit, memory_usage))
+    else:
+        print('Summary: keys: {}'.format(limit))
+
 
 def execute_command(client: Redis, command_str: str):
     split = command_str.split()
-    command = split[0].upper()
+    command = split[0].lower()
 
-    if command == 'GET':
-        get_command(client, split[1:])
-    elif command == 'TYPE':
-        type_command(client, split[1:])
-    elif command == 'HGET':
-        hget_command(client, split[1:])
-    elif command == 'HGETALL':
-        hgetall_command(client, split[1:])
+    if command in supported_commands:
+        globals()[command + '_command'](client, split[1:])
     else:
         print("Unsupported command '{}'".format(split[0]), file=sys.stderr)
 
@@ -206,6 +222,28 @@ def hgetall_command(client: Redis, param):
             count += 1
             print(f'{count}) "{v.decode()}"')
 
+
+@redis_check
+def smembers_command(client: Redis, param):
+    if len(param) == 0:
+        print('key required', file=sys.stderr)
+        sys.exit(1)
+    key = param[0]
+    result = client.smembers(key)
+    if len(result) == 0:
+        print('(empty list or set')
+    else:
+        count = 0
+        for value in result:
+            count += 1
+            print(f'{count}) "{value.decode()}"')
+
+
+@redis_check
+def info_command(client: Redis, param):
+    info = client.info(section=None if len(param) == 0 else param[0])
+    for key, value in info.items():
+        print(f'{key}: {value}')
 
 def deserialize_avro(data):
     from fastavro import reader
