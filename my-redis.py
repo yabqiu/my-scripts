@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 
-import sys
-import io
+import sys, io, os
 from optparse import OptionParser
 from redis import Redis, exceptions
 import gzip
+import tempfile
+import json
 
 verbose = False
 
@@ -18,7 +19,6 @@ def main():
     parser.add_option("-n", '--db', default=0, type='int', help='Database number.')
     parser.add_option('--scan', action='store_true', help='List all keys using the SCAN command.')
     parser.add_option('--pattern', default='*', help='Useful with --scan to specify a SCAN pattern.')
-    parser.add_option('-c', '--command', help='Execute Redis command')
     parser.add_option('--verbose', action='store_true', default=False, help='Verbose mode')
 
     if len(sys.argv) < 2:
@@ -27,27 +27,66 @@ def main():
 
     (options, args) = parser.parse_args()
 
+    redis_command = parse_redis_command()
+
     global verbose
     verbose = options.verbose
 
     if options.group:
         options.hostname = parse_hostname_by_elasticache_cluster_name(options.group.split('/')[0])
+        verbose_info('Get endpoint {}'.format(options.hostname))
     if '/' in options.group:
         options.db = int(options.group.split('/')[1])
 
     client = Redis(host=options.hostname, db=options.db, password=options.password)
-    if options.command:
-        execute_command(client, options.command)
+    if redis_command:
+        execute_command(client, redis_command)
     elif options.scan:
         scan_keys(client, options.pattern)
 
 
+def parse_redis_command():
+    redis_command = []
+    found__ = False
+    for arg in sys.argv:
+        if found__:
+            redis_command.append(arg)
+        if arg == '--':
+            found__ = True
+    if len(redis_command) == 0:
+        return ''
+    return ' '.join(redis_command)
+
+
+
+
+def redis_check(func):
+    def wrapper(*args):
+        try:
+            func(*args)
+        except exceptions.ResponseError as er:
+            print(er.args[0])
+    return wrapper
+
+
 def parse_hostname_by_elasticache_cluster_name(cluster):
+    parsed_config = os.path.join(tempfile.gettempdir(), 'parsed_endpoints.txt')
+
+    if os.path.exists(parsed_config):
+        with open(parsed_config) as fd:
+            for line in fd:
+                endpoint = line.rstrip().split("=")
+                if endpoint[0] == cluster:
+                    return endpoint[1]
+
     import boto3
     ec = boto3.client('elasticache')
     result = ec.describe_replication_groups(ReplicationGroupId=cluster)
     primary = result['ReplicationGroups'][0]['NodeGroups'][0]['PrimaryEndpoint']['Address']
-    verbose_info('Get endpoint of {}: {}'.format(cluster, primary))
+
+    with open(parsed_config, 'a') as fd:
+        fd.write(f'{cluster}={primary}')
+
     return primary
 
 
@@ -71,47 +110,86 @@ def execute_command(client: Redis, command_str: str):
         get_command(client, split[1:])
     elif command == 'TYPE':
         type_command(client, split[1:])
+    elif command == 'HGET':
+        hget_command(client, split[1:])
+    elif command == 'HGETALL':
+        hgetall_command(client, split[1:])
     else:
         print("Unsupported command '{}'".format(split[0]), file=sys.stderr)
 
 
+@redis_check
 def get_command(client: Redis, param):
     if len(param) == 0:
         print('require key', file=sys.stderr)
+        sys.exit(1)
 
     key = param[0]
-    try:
-        data = client.get(key)
-        if data is not None:
-            verbose_info("object size: {}".format(len(data)))
-            if data[0:2] == bytes.fromhex('1f8b'):
-                verbose_info("found gzip format data at key {}".format(key))
-                verbose_info("bytes: {}".format(data))
-                data = gzip.decompress(data)
-            elif data[0:4] == bytes.fromhex('4f626a01'):
-                verbose_info("found Avro format at at key {}".format(key))
-                verbose_info("bytes: {}".format(data))
-                data = deserialize_avro(data)
-            try:
-                print(data.decode(), flush=True)
-            except UnicodeDecodeError:
-                print(data)
-        else:
+    data = client.get(key)
+    if data is not None:
+        verbose_info("object size: {}".format(len(data)))
+        if data[0:2] == bytes.fromhex('1f8b'):
+            verbose_info("found gzip format data at key {}".format(key))
+            verbose_info("bytes: {}".format(data))
+            data = gzip.decompress(data)
+        elif data[0:4] == bytes.fromhex('4f626a01'):
+            verbose_info("found Avro format at at key {}".format(key))
+            verbose_info("bytes: {}".format(data))
+            data = deserialize_avro(data)
+        try:
+            print(data.decode(), flush=True)
+        except UnicodeDecodeError:
             print(data)
-    except exceptions.ResponseError as er:
-        print(er.args[0])
+    else:
+        print(data)
 
 
+@redis_check
 def type_command(client: Redis, param):
     if len(param) == 0:
         print('require key', file=sys.stderr)
+        sys.exit(1)
     key = param[0]
     print(client.type(key).decode())
 
 
+@redis_check
+def hget_command(client: Redis, param):
+    if len(param) < 2:
+        print('require key and field', file=sys.stderr)
+        sys.exit(1)
+    result = client.hget(param[0], param[1])
+    if len(result) == 0:
+        print('(nil)')
+    else:
+        count = 0
+        for k, v in result.items():
+            count += 1
+            print(f'{count}) "{k.decode()}"')
+            count += 1
+            print(f'{count}) "{v.decode()}"')
+
+
+@redis_check
+def hgetall_command(client: Redis, param):
+    if len(param) == 0:
+        print('key required', file=sys.stderr)
+        sys.exit(1)
+    key = param[0]
+    result = client.hgetall(key)
+    if len(result) == 0:
+        print('(empty list or set')
+    else:
+        count = 0
+        for k, v in result.items():
+            count += 1
+            print(f'{count}) "{k.decode()}"')
+            count += 1
+            print(f'{count}) "{v.decode()}"')
+
+
 def deserialize_avro(data):
     from fastavro import reader
-    import json
 
     buf = io.BytesIO(data)
     lines = []
