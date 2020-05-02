@@ -14,6 +14,7 @@ def main():
     parser = OptionParser(add_help_option=False)
     parser.add_option("-h", "--hostname", default='127.0.0.1', help='Server hostname (default: 127.0.0.1).')
     parser.add_option('-g', '--group', help='AWS ElastiCache cluster name, will use primary node to access')
+    parser.add_option('--force-parse-endpoint', action='store_true', default=False, help='Force parse AWS ElasticCache cluster name')
     parser.add_option('-a', '--password', help='Password to use when connecting to the server.')
     parser.add_option('--help', action='help')
     parser.add_option("-n", '--db', default=0, type='int', help='Database number.')
@@ -33,8 +34,9 @@ def main():
     verbose = options.verbose
 
     if options.group:
-        options.hostname = parse_hostname_by_elasticache_cluster_name(options.group.split('/')[0])
-        verbose_info('Get endpoint {}'.format(options.hostname))
+        options.hostname = parse_hostname_by_elasticache_cluster_name(options.group.split('/')[0],
+                                                                      options.force_parse_endpoint)
+        verbose_info('Endpoint: {}'.format(options.hostname))
     if '/' in options.group:
         options.db = int(options.group.split('/')[1])
 
@@ -58,8 +60,6 @@ def parse_redis_command():
     return ' '.join(redis_command)
 
 
-
-
 def redis_check(func):
     def wrapper(*args):
         try:
@@ -69,23 +69,30 @@ def redis_check(func):
     return wrapper
 
 
-def parse_hostname_by_elasticache_cluster_name(cluster):
+def parse_hostname_by_elasticache_cluster_name(cluster, force):
     parsed_config = os.path.join(tempfile.gettempdir(), 'parsed_endpoints.txt')
-
-    if os.path.exists(parsed_config):
-        with open(parsed_config) as fd:
-            for line in fd:
-                endpoint = line.rstrip().split("=")
-                if endpoint[0] == cluster:
-                    return endpoint[1]
+    if not force:
+        if os.path.exists(parsed_config):
+            with open(parsed_config) as fd:
+                for line in fd:
+                    endpoint = line.rstrip().split("=")
+                    if endpoint[0] == cluster:
+                        return endpoint[1]
 
     import boto3
+    import fileinput
     ec = boto3.client('elasticache')
     result = ec.describe_replication_groups(ReplicationGroupId=cluster)
     primary = result['ReplicationGroups'][0]['NodeGroups'][0]['PrimaryEndpoint']['Address']
 
-    with open(parsed_config, 'a') as fd:
-        fd.write(f'{cluster}={primary}')
+    if not os.path.exists(parsed_config):
+        with open(parsed_config, 'a') as fd:
+            fd.write(f'{cluster}={primary}')
+    else:
+        for line in fileinput.input(parsed_config, inplace=True):
+            if line.rstrip().split('=')[0] == cluster:
+                line = f'cluster={primary}'
+        fileinput.close()
 
     return primary
 
@@ -129,11 +136,11 @@ def get_command(client: Redis, param):
     if data is not None:
         verbose_info("object size: {}".format(len(data)))
         if data[0:2] == bytes.fromhex('1f8b'):
-            verbose_info("found gzip format data at key {}".format(key))
+            verbose_info("gzip format")
             verbose_info("bytes: {}".format(data))
             data = gzip.decompress(data)
         elif data[0:4] == bytes.fromhex('4f626a01'):
-            verbose_info("found Avro format at at key {}".format(key))
+            verbose_info("Avro format")
             verbose_info("bytes: {}".format(data))
             data = deserialize_avro(data)
         try:
