@@ -6,21 +6,26 @@ from redis import Redis, exceptions
 import gzip
 import tempfile
 import json
+import functools
 
+print = functools.partial(print, flush=True)
 verbose = False
 
 
 def main():
     parser = OptionParser(add_help_option=False)
-    parser.add_option("-h", "--hostname", default='127.0.0.1', help='Server hostname (default: 127.0.0.1).')
-    parser.add_option('-g', '--group', help='AWS ElastiCache cluster name, will use primary node to access')
-    parser.add_option('--force-parse-endpoint', action='store_true', default=False, help='Force parse AWS ElasticCache cluster name')
-    parser.add_option('-a', '--password', help='Password to use when connecting to the server.')
-    parser.add_option('--help', action='help')
-    parser.add_option("-n", '--db', default=0, type='int', help='Database number.')
-    parser.add_option('--scan', action='store_true', help='List all keys using the SCAN command.')
-    parser.add_option('--pattern', default='*', help='Useful with --scan to specify a SCAN pattern.')
-    parser.add_option('--verbose', action='store_true', default=False, help='Verbose mode')
+    parser.add_option("-h", "--hostname", default='127.0.0.1', metavar='<hostname>',
+                      help='Server hostname (default: 127.0.0.1).')
+    parser.add_option('-g', '--group', metavar='<cluster_name>',
+                      help='AWS ElastiCache cluster name, <replicationGroupId>')
+    parser.add_option('--force-parse-endpoint', action='store_true', default=False,
+                      help='Force parse AWS ElasticCache cluster name')
+    parser.add_option('-a', '--password', metavar='<password>', help='Password to use when connecting to the server.')
+    parser.add_option("-n", '--db', metavar='<db>', default=0, type='int', help='Redis database number.')
+    parser.add_option('--scan', metavar='<pattern>', help='List all keys using the SCAN command for the pattern.')
+    parser.add_option('-t', '--top', default=sys.maxsize, metavar='<num>', help='List top N found keys when using --scan.')
+    parser.add_option('-v', '--verbose', action='store_true', default=False, help='Verbose mode')
+    parser.add_option('--help', action='help', help='Print this help information.')
 
     if len(sys.argv) < 2:
         parser.print_help()
@@ -33,6 +38,9 @@ def main():
     global verbose
     verbose = options.verbose
 
+    if redis_command is None and options.scan == os.path.basename(__file__):
+        return
+
     if options.group:
         options.hostname = parse_hostname_by_elasticache_cluster_name(options.group.split('/')[0],
                                                                       options.force_parse_endpoint)
@@ -44,7 +52,7 @@ def main():
     if redis_command:
         execute_command(client, redis_command)
     elif options.scan:
-        scan_keys(client, options.pattern)
+        scan_keys(client, options.scan, int(options.top))
 
 
 def parse_redis_command():
@@ -56,7 +64,7 @@ def parse_redis_command():
         if arg == '--':
             found__ = True
     if len(redis_command) == 0:
-        return ''
+        return None
     return ' '.join(redis_command)
 
 
@@ -97,13 +105,17 @@ def parse_hostname_by_elasticache_cluster_name(cluster, force):
     return primary
 
 
-def scan_keys(client: Redis, pattern):
+def scan_keys(client: Redis, pattern, top: int):
+    limit = 0
     count = 20000
     result = client.scan(0, pattern, count)
     cursor = result[0]
     while cursor != 0:
         for k in result[1]:
-            print(k.decode(), flush=True)
+            print(k.decode())
+            limit += 1
+            if limit == top:
+                return
 
         result = client.scan(cursor, pattern, count)
         cursor = result[0]
@@ -134,7 +146,7 @@ def get_command(client: Redis, param):
     key = param[0]
     data = client.get(key)
     if data is not None:
-        verbose_info("object size: {}".format(len(data)))
+        verbose_info("Object size: {}".format(len(data)))
         if data[0:2] == bytes.fromhex('1f8b'):
             verbose_info("gzip format")
             verbose_info("bytes: {}".format(data))
@@ -144,7 +156,7 @@ def get_command(client: Redis, param):
             verbose_info("bytes: {}".format(data))
             data = deserialize_avro(data)
         try:
-            print(data.decode(), flush=True)
+            print(data.decode())
         except UnicodeDecodeError:
             print(data)
     else:
@@ -207,12 +219,12 @@ def deserialize_avro(data):
 
 def verbose_info(msg):
     if verbose:
-        print(msg, flush=True, file=sys.stderr)
+        print(msg, file=sys.stderr)
 
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print('Interrupted')
+        print(' Interrupted')
         sys.exit(0)
