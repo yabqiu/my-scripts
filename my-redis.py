@@ -7,10 +7,11 @@ import gzip
 import tempfile
 import json
 import functools
+import json
 
 print = functools.partial(print, flush=True)
 verbose = False
-supported_commands = ['get', 'type', 'hget', 'hgetall', 'smembers', 'info']
+supported_commands = ['get', 'type', 'hget', 'hgetall', 'smembers', 'info', 'memory_usage']
 
 
 def main():
@@ -46,13 +47,23 @@ def main():
         return
 
     if options.group:
-        options.hostname = parse_hostname_by_elasticache_cluster_name(options.group.split('/')[0],
-                                                                      options.force_parse_endpoint)
-        verbose_info('Endpoint: {}'.format(options.hostname))
-    if '/' in options.group:
-        options.db = int(options.group.split('/')[1])
+        primary, reader = parse_hostname_by_elasticache_cluster_name(options.group.split('/')[0],
+                                                                     options.force_parse_endpoint)
+        verbose_info('PrimaryEndpoint: {}'.format(primary))
+        verbose_info('ReaderEndpoint:  {}'.format(reader))
 
-    client = Redis(host=options.hostname, db=options.db, password=options.password)
+        options.hostname = primary
+        if '/' in options.group:
+            options.db = int(options.group.split('/')[1])
+
+    client:Redis = Redis(host=options.hostname, db=options.db, password=options.password)
+
+    try:
+        client.ping()
+    except exceptions.ConnectionError:
+        print(f'Cannot connect to {options.hostname}')
+        sys.exit(1)
+
     if redis_command:
         execute_command(client, redis_command)
     elif options.scan:
@@ -89,24 +100,26 @@ def parse_hostname_by_elasticache_cluster_name(cluster, force):
                 for line in fd:
                     endpoint = line.rstrip().split("=")
                     if endpoint[0] == cluster:
-                        return endpoint[1]
+                        primary_and_reader = endpoint[1].split(',')
+                        return (primary_and_reader[0], primary_and_reader[1])
 
     import boto3
     import fileinput
     ec = boto3.client('elasticache')
     result = ec.describe_replication_groups(ReplicationGroupId=cluster)
     primary = result['ReplicationGroups'][0]['NodeGroups'][0]['PrimaryEndpoint']['Address']
+    reader = result['ReplicationGroups'][0]['NodeGroups'][0]['ReaderEndpoint']['Address']
 
     if not os.path.exists(parsed_config):
         with open(parsed_config, 'a') as fd:
-            fd.write(f'{cluster}={primary}')
+            fd.write(f'{cluster}={primary},{reader}')
     else:
         for line in fileinput.input(parsed_config, inplace=True):
             if line.rstrip().split('=')[0] == cluster:
-                line = f'cluster={primary}'
+                line = f'cluster={primary},{reader}'
         fileinput.close()
 
-    return primary
+    return (primary, reader)
 
 
 def scan_keys(client: Redis, pattern, top: int, show_memory_usage):
@@ -115,7 +128,7 @@ def scan_keys(client: Redis, pattern, top: int, show_memory_usage):
     count = 20000
     result = client.scan(0, pattern, count)
     cursor = result[0]
-    while cursor != 0:
+    while len(result[1]) > 0:
         batch = []
         for key in result[1]:
             batch.append(key)
@@ -150,7 +163,13 @@ def execute_command(client: Redis, command_str: str):
     if command in supported_commands:
         globals()[command + '_command'](client, split[1:])
     else:
-        print("Unsupported command '{}'".format(split[0]), file=sys.stderr)
+        # print("Unsupported command '{}'".format(split[0]), file=sys.stderr)
+        unknown_command(client, split[:])
+
+
+def unknown_command(client: Redis, param):
+    result = client.execute_command(*param)
+    print(json.dumps(result, indent=4))
 
 
 @redis_check
@@ -194,15 +213,8 @@ def hget_command(client: Redis, param):
         print('require key and field', file=sys.stderr)
         sys.exit(1)
     result = client.hget(param[0], param[1])
-    if len(result) == 0:
-        print('(nil)')
-    else:
-        count = 0
-        for k, v in result.items():
-            count += 1
-            print(f'{count}) "{k.decode()}"')
-            count += 1
-            print(f'{count}) "{v.decode()}"')
+    value = '(nil)' if result is None else f'"{result.decode()}"'
+    print(value)
 
 
 @redis_check
@@ -244,6 +256,16 @@ def info_command(client: Redis, param):
     info = client.info(section=None if len(param) == 0 else param[0])
     for key, value in info.items():
         print(f'{key}: {value}')
+
+
+@redis_check
+def memory_usage_command(client: Redis, param):
+    if len(param) == 0:
+        print('require key', file=sys.stderr)
+        sys.exit(1)
+    key = param[0]
+    print(client.memory_usage(key))
+
 
 def deserialize_avro(data):
     from fastavro import reader
