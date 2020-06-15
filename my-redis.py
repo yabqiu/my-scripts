@@ -128,7 +128,7 @@ def scan_keys(client: Redis, pattern, top: int, show_memory_usage):
     count = 20000
     result = client.scan(0, pattern, count)
     cursor = result[0]
-    while len(result[1]) > 0:
+    while True:
         batch = []
         for key in result[1]:
             batch.append(key)
@@ -147,8 +147,11 @@ def scan_keys(client: Redis, pattern, top: int, show_memory_usage):
         if limit == top:
             break
 
-        result = client.scan(cursor, pattern, count)
-        cursor = result[0]
+        if cursor != 0:
+            result = client.scan(cursor, pattern, count)
+            cursor = result[0]
+        else:
+            break
 
     if show_memory_usage:
         print('Summary: keys: {}, total memory usage: {}'.format(limit, memory_usage))
